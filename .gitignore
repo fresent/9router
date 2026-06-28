@@ -73,5 +73,40 @@ scripts/agSniffer/*
 gitbooks/*
 gitbook/README.md
 
+<<<<<<< Updated upstream
+=======
+scripts/agSniffer/*
+gitbooks/*
+gitbook/README.md
+
+# ── GSD baseline (auto-generated) ──
+.gsd/
+.gsd-id
+.mcp.json
+.bg-shell/
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+*.code-workspace
+.env
+.env.*
+node_modules/
+.next/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+venv/
+target/
+vendor/
+*.log
+coverage/
+.cache/
+tmp/
+
+>>>>>>> Stashed changes
 # Refactor backup reference (do not bundle/lint)
 open-sse.old/

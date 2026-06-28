@@ -4,6 +4,9 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 
+// Models known to support OpenAI-style reasoning_effort parameter.
+const REASONING_EFFORT_MODELS = [/deepseek/i, /qwen/i, /kimi/i, /grok/i, /gpt/i];
+
 /**
  * BaseExecutor - Base class for provider executors
  */
@@ -125,7 +128,19 @@ export class BaseExecutor {
 
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
       const url = this.buildUrl(model, stream, urlIndex, credentials);
-      const transformedBody = this.transformRequest(model, body, stream, credentials);
+      let transformedBody = this.transformRequest(model, body, stream, credentials);
+
+      // Smart thinking/reasoning_effort injection based on model type.
+      // Only injects when neither thinking nor reasoning_effort is already present.
+      // SKIP injection for native Ollama /api/chat — it uses Ollama format (options dict)
+      // not OpenAI-style parameters. Sending reasoning_effort there causes empty responses.
+      // SKIP injection for Codex — it uses its own reasoning format (reasoning.effort).
+      if (!transformedBody.reasoning_effort && !transformedBody.thinking && !url.includes("/api/chat") && this.provider !== "codex") {
+        if (REASONING_EFFORT_MODELS.some(re => re.test(model))) {
+          transformedBody = { ...transformedBody, reasoning_effort: "high" };
+        }
+      }
+
       const headers = this.buildHeaders(credentials, stream);
 
       if (!retryAttemptsByUrl[urlIndex]) retryAttemptsByUrl[urlIndex] = 0;

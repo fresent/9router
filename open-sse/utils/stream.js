@@ -3,6 +3,7 @@ import { FORMATS } from "../translator/formats.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
 import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
+import { createDsmlStreamFilter } from "./dsmlFilter.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
@@ -13,6 +14,12 @@ export { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER };
 
 // sharedEncoder is stateless — safe to share across streams
 const sharedEncoder = new TextEncoder();
+
+/** DSML model detection — covers DeepSeek, GLM, Kimi and other models that emit DSML-style tool calls in reasoning_content */
+function isDsmlModel(modelName) {
+  if (!modelName || typeof modelName !== "string") return false;
+  return /deepseek|glm|kimi/i.test(modelName);
+}
 
 /**
  * Stream modes
@@ -67,6 +74,10 @@ export function createSSEStream(options = {}) {
   let sseEmittedCount = 0;
   const eventTypeCounts = {};
 
+  // DSML filter state (per-stream, for DeepSeek/GLM/Kimi models)
+  const dsmlFilter = createDsmlStreamFilter();
+  let dsmlConvertedToolCalls = null;
+
   // Track Responses API event framing for same-format passthrough (codex)
   let currentOpenAIResponsesEvent = null;
   let openAIResponsesTerminalSeen = false;
@@ -105,7 +116,7 @@ export function createSSEStream(options = {}) {
 
           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() !== "[DONE]") {
             try {
-              const parsed = JSON.parse(trimmed.slice(5).trim());
+              let parsed = JSON.parse(trimmed.slice(5).trim());
 
               const idFixed = fixInvalidId(parsed);
 
@@ -127,6 +138,39 @@ export function createSSEStream(options = {}) {
                     delete choice.content_filter_results;
                     fieldsInjected = true;
                   }
+                }
+              }
+
+              // Strip DSML artifacts from DSML models (stateful: handles blocks spanning chunks)
+              let dsmlCleaned = null;
+              let dsmlModified = false;
+              if (isDsmlModel(model)) {
+                dsmlCleaned = dsmlFilter.feed(
+                  parsed.choices?.[0]?.delta?.content,
+                  parsed.choices?.[0]?.delta?.reasoning_content
+                );
+                if (!dsmlCleaned && !parsed.choices?.[0]?.finish_reason && !parsed.choices?.[0]?.delta?.tool_calls) continue;
+                if (dsmlCleaned && dsmlCleaned.content !== parsed.choices[0].delta.content) {
+                  parsed = {
+                    ...parsed,
+                    choices: [{ ...parsed.choices[0], delta: { ...parsed.choices[0].delta, content: dsmlCleaned.content ?? undefined } }],
+                  };
+                  dsmlModified = true;
+                }
+                if (dsmlCleaned && dsmlCleaned.reasoning !== parsed.choices[0].delta.reasoning_content) {
+                  parsed = {
+                    ...parsed,
+                    choices: [{ ...parsed.choices[0], delta: { ...parsed.choices[0].delta, reasoning_content: dsmlCleaned.reasoning ?? undefined } }],
+                  };
+                  dsmlModified = true;
+                }
+                if (dsmlCleaned && dsmlCleaned.toolCalls && dsmlCleaned.toolCalls.length > 0) {
+                  parsed = {
+                    ...parsed,
+                    choices: [{ ...parsed.choices[0], delta: { ...parsed.choices[0].delta, tool_calls: dsmlCleaned.toolCalls } }],
+                  };
+                  dsmlModified = true;
+                  dsmlConvertedToolCalls = dsmlCleaned.toolCalls;
                 }
               }
 
@@ -152,6 +196,17 @@ export function createSSEStream(options = {}) {
               }
 
               const isFinishChunk = parsed.choices?.[0]?.finish_reason;
+
+              // Ensure finish_reason is tool_calls when tool calls were injected
+              if (isFinishChunk && (dsmlCleaned?.toolCalls?.length > 0 || dsmlConvertedToolCalls)) {
+                parsed.choices[0].finish_reason = "tool_calls";
+                // Also inject tool_calls if they're not on this chunk (some clients need it on the finish chunk)
+                if (!parsed.choices[0].delta?.tool_calls) {
+                  parsed.choices[0].delta = { ...parsed.choices[0].delta, tool_calls: dsmlConvertedToolCalls };
+                }
+                dsmlModified = true;
+              }
+
               if (isFinishChunk && !hasValidUsage(parsed.usage)) {
                 const estimated = estimateUsage(body, totalContentLength, FORMATS.OPENAI);
                 parsed.usage = filterUsageForFormat(estimated, FORMATS.OPENAI);
@@ -191,7 +246,7 @@ export function createSSEStream(options = {}) {
         // Translate mode
         if (!trimmed) continue;
 
-        const parsed = parseSSELine(trimmed, targetFormat);
+        let parsed = parseSSELine(trimmed, targetFormat);
         if (!parsed) continue;
 
         // Responses API same-format passthrough: preserve event framing + track terminal state
@@ -266,6 +321,70 @@ export function createSSEStream(options = {}) {
         const extracted = extractUsage(parsed);
         if (extracted) state.usage = extracted; // Keep original usage for logging
 
+        // Strip DSML artifacts before translation (stateful: handles blocks spanning chunks)
+        // Use model-name-based detection to cover all providers offering DSML models
+        if (isDsmlModel(model)) {
+          let deltaContent, deltaReasoning;
+          let isOpenaiFormat = false;
+          if (parsed.choices?.[0]?.delta) {
+            deltaContent = parsed.choices[0].delta.content;
+            deltaReasoning = parsed.choices[0].delta.reasoning_content;
+            isOpenaiFormat = true;
+          } else if (parsed.message) {
+            deltaContent = parsed.message.content;
+            deltaReasoning = parsed.message.thinking;
+          }
+          if (deltaContent || deltaReasoning) {
+            const dsmlCleaned = dsmlFilter.feed(deltaContent, deltaReasoning);
+            if (!dsmlCleaned && !(parsed.choices?.[0]?.finish_reason || parsed.type === "message_delta")) continue;
+            if (isOpenaiFormat) {
+              const delta = parsed.choices[0].delta;
+              if (dsmlCleaned && dsmlCleaned.content !== delta.content) {
+                parsed = {
+                  ...parsed,
+                  choices: [{ ...parsed.choices[0], delta: { ...delta, content: dsmlCleaned.content ?? undefined } }],
+                };
+              }
+              if (dsmlCleaned && dsmlCleaned.reasoning !== delta.reasoning_content) {
+                parsed = {
+                  ...parsed,
+                  choices: [{ ...parsed.choices[0], delta: { ...parsed.choices[0].delta, reasoning_content: dsmlCleaned.reasoning ?? undefined } }],
+                };
+              }
+              if (dsmlCleaned && dsmlCleaned.toolCalls && dsmlCleaned.toolCalls.length > 0) {
+                parsed = {
+                  ...parsed,
+                  choices: [{ ...parsed.choices[0], delta: { ...parsed.choices[0].delta, tool_calls: dsmlCleaned.toolCalls } }],
+                };
+              }
+            } else if (parsed.message) {
+              if (dsmlCleaned && dsmlCleaned.content !== parsed.message.content) {
+                parsed = {
+                  ...parsed,
+                  message: { ...parsed.message, content: dsmlCleaned.content ?? parsed.message.content }
+                };
+              }
+              if (dsmlCleaned && dsmlCleaned.reasoning !== parsed.message.thinking) {
+                parsed = {
+                  ...parsed,
+                  message: { ...parsed.message, thinking: dsmlCleaned.reasoning ?? null }
+                };
+              }
+              if (dsmlCleaned && dsmlCleaned.toolCalls && dsmlCleaned.toolCalls.length > 0) {
+                parsed = {
+                  ...parsed,
+                  message: {
+                    ...parsed.message,
+                    tool_calls: dsmlCleaned.toolCalls.map(function(tc) {
+                      return { function: { name: tc.function.name, arguments: tc.function.arguments } };
+                    })
+                  }
+                };
+              }
+            }
+          }
+        }
+
         // Responses same-format passthrough: re-emit with original event framing
         if (keepsOpenAIResponsesFormat && openAIResponsesEventName) {
           const output = formatSSE({ event: openAIResponsesEventName, data: parsed }, sourceFormat);
@@ -327,6 +446,25 @@ export function createSSEStream(options = {}) {
         if (remaining) buffer += remaining;
 
         if (mode === STREAM_MODE.PASSTHROUGH) {
+          // Flush any remaining DSML buffer
+          if (isDsmlModel(model)) {
+            const flushedDsml = dsmlFilter.flush();
+            if (flushedDsml?.reasoning) {
+              // Emit remaining cleaned reasoning as a final chunk
+              const flushChunk = {
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: model,
+                choices: [{ index: 0, delta: { reasoning_content: flushedDsml.reasoning }, finish_reason: null }]
+              };
+              const flushOutput = `data: ${JSON.stringify(flushChunk)}
+`;
+              reqLogger?.appendConvertedChunk?.(flushOutput);
+              controller.enqueue(sharedEncoder.encode(flushOutput));
+            }
+          }
+
           if (buffer) {
             let output = buffer;
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
@@ -377,6 +515,30 @@ export function createSSEStream(options = {}) {
               }
             }
 
+            if (translated?.length > 0) {
+              for (const item of translated) {
+                if (item === null || item === undefined) continue;
+                const output = formatSSE(item, sourceFormat);
+                reqLogger?.appendConvertedChunk?.(output);
+                controller.enqueue(sharedEncoder.encode(output));
+              }
+            }
+          }
+        }
+
+        // Flush any remaining DSML buffer in translate mode
+        if (isDsmlModel(model)) {
+          const flushedDsml = dsmlFilter.flush();
+          if (flushedDsml?.reasoning) {
+            // Emit remaining cleaned reasoning as a final chunk
+            const flushChunk = {
+              id: `chatcmpl-${Date.now()}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{ index: 0, delta: { reasoning_content: flushedDsml.reasoning }, finish_reason: null }]
+            };
+            const translated = translateResponse(targetFormat, sourceFormat, flushChunk, state);
             if (translated?.length > 0) {
               for (const item of translated) {
                 if (item === null || item === undefined) continue;
